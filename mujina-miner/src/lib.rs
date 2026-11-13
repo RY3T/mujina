@@ -19,3 +19,6 @@ pub mod tracing;
 pub mod transport;
 pub mod types;
 mod u256;
+
+/// RY3T release version of this build (see `build.rs`).
+pub const VERSION: &str = env!("MUJINA_VERSION");

@@ -21,6 +21,7 @@ use crate::api_client::types::{BoardState, MinerPatchRequest, MinerState, Source
 pub fn routes() -> OpenApiRouter<SharedState> {
     OpenApiRouter::new()
         .routes(routes!(health))
+        .routes(routes!(get_version))
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
@@ -63,6 +64,25 @@ async fn post_identify(Json(req): Json<WindowRequest>) -> StatusCode {
 async fn post_psu_probe(Json(req): Json<WindowRequest>) -> StatusCode {
     crate::commissioning::start_psu_probe(req.seconds.unwrap_or(20));
     StatusCode::NO_CONTENT
+}
+
+/// Build version of this mujina-minerd.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct VersionInfo {
+    /// RY3T release, e.g. `ry3t-v1.1.0`; `-N-gHASH` when built past a
+    /// release, `-dirty` when built from uncommitted changes.
+    pub version: &'static str,
+}
+
+/// The version this binary was built as.
+#[utoipa::path(
+    get,
+    path = "/version",
+    tag = "health",
+    responses((status = OK, description = "Build version", body = VersionInfo)),
+)]
+async fn get_version() -> Json<VersionInfo> {
+    Json(VersionInfo { version: crate::VERSION })
 }
 
 /// Health check endpoint.
