@@ -617,6 +617,7 @@ mod tests {
                 temperature_c: Some(42),
             }],
             threads: vec![],
+            ..Default::default()
         }];
 
         assert_eq!(max_fan_rpm(&state), Some(6200));

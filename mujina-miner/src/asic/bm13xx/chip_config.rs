@@ -222,7 +222,14 @@ impl ChipConfig {
     /// Searches for PLL divider values that produce the closest match
     /// to the target frequency. When multiple configs achieve the same
     /// accuracy, prefers the one with the lowest VCO frequency to stay
-    /// in the VCO's optimal range (~2000–2300 MHz). The FBDIV search
+    /// in the VCO's optimal range (~2000–2300 MHz).
+    ///
+    /// Always returns the CLOSEST reachable setting (within ~1.6 MHz over
+    /// every family's whole range). It used to accept only settings within
+    /// 1 MHz and otherwise fall back to a fixed default (FBDIV min, refdiv 2,
+    /// postdiv 6×6 = ~56 MHz on BM1362): frequencies like 476, 501.3, 524 or
+    /// 549 MHz then silently dropped every chip to ~56 MHz until the next
+    /// frequency write — the ~600 W "dips" seen on site 2. The FBDIV search
     /// range and the postdiv constraint come from
     /// [`ChipConfig::pll_params`] so BM1366 uses 0x90–0xEB with strict
     /// `>`, while BM1362 / BM1370 use 0xA0–0xEF with `>=`.
@@ -263,8 +270,7 @@ impl ChipConfig {
                         let error = (target_freq - actual_freq).abs();
                         let vco = CRYSTAL_MHZ * fb_div as f32 / ref_div as f32;
 
-                        if error < 1.0
-                            && (error < min_error || (error == min_error && vco < best_vco))
+                        if error < min_error || (error == min_error && vco < best_vco)
                         {
                             min_error = error;
                             best_vco = vco;
@@ -557,6 +563,45 @@ mod tests {
                 "Our algorithm produced worse result than esp-miner for {}MHz",
                 target_mhz
             );
+        }
+    }
+
+    fn actual_mhz(pll: &PllConfig) -> f32 {
+        let post_div1 = ((pll.post_div >> 4) & 0xf) + 1;
+        let post_div2 = (pll.post_div & 0xf) + 1;
+        25.0 * pll.fb_div as f32
+            / (pll.ref_div as f32 * post_div1 as f32 * post_div2 as f32)
+    }
+
+    /// Every frequency a family accepts must get a PLL setting close to it.
+    /// The search used to fall back to ~56 MHz when nothing was within 1 MHz
+    /// (476, 501.3, 524, 549 MHz on BM1362), stalling every chip until the
+    /// next frequency write.
+    #[test]
+    fn pll_is_close_for_every_frequency_in_range() {
+        for (name, config) in [("bm1362", bm1362()), ("bm1366", bm1366()), ("bm1370", bm1370())] {
+            let (lo, hi) = (config.min_freq.mhz(), config.max_freq.mhz());
+            let mut f = lo;
+            while f <= hi {
+                let pll = config.calculate_pll(Frequency::from_mhz(f));
+                let err = (actual_mhz(&pll) - f).abs();
+                assert!(
+                    err <= 1.6,
+                    "{name}: {f:.2} MHz -> {:.2} MHz (error {err:.2})",
+                    actual_mhz(&pll)
+                );
+                f += 0.05;
+            }
+        }
+    }
+
+    /// The exact values that dipped on site 2 (2026-11-02..13).
+    #[test]
+    fn bm1362_former_holes_get_a_real_setting() {
+        let config = bm1362();
+        for f in [476.0, 501.3, 523.9, 524.0, 548.7, 551.2] {
+            let got = actual_mhz(&config.calculate_pll(Frequency::from_mhz(f)));
+            assert!((got - f).abs() <= 1.6, "{f} MHz -> {got} MHz");
         }
     }
 

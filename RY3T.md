@@ -45,7 +45,7 @@ version=...`) and serves it at `GET /api/v0/version`:
 ## Releasing
 
 `mujina-miner` has a path dependency on `../../amlogic-cb-tools`: a clone of
-amlogic-cb-tools (branch `pic-microcontroller-driver`) must sit next to this
+[RY3T/amlogic-cb-tools](https://github.com/RY3T/amlogic-cb-tools) (branch `main`) must sit next to this
 checkout. The release script refuses it with uncommitted changes and records
 its commit in the tag and the release notes.
 

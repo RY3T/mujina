@@ -2586,6 +2586,7 @@ mod tests {
             hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
             hashrate_estimator_1min: HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN),
             paused: false,
+            interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             active_census_last_seen: [None; 256],
             census_cursor: 0,

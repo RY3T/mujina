@@ -2065,8 +2065,17 @@ impl NativeAmlogicPsu {
     ///
     /// `spawn_blocking` moves the exchange onto tokio's dedicated
     /// blocking-thread-pool (grown on demand, separate from the async worker
-    /// pool), so a wedged bus can leak at most one blocking-pool thread —
-    /// never the reactor. `NativeAmlogicPsu` doesn't hold an open file handle
+    /// pool), so a wedged bus never takes the reactor down.
+    ///
+    /// Only ONE exchange may be in flight: the blocking thread holds
+    /// [`psu_exchange_slot`] until its ioctl returns. Without that, every
+    /// caller whose `timeout` fired left its thread parked in the kernel and
+    /// the next telemetry tick started another; with the PSU relay off for a
+    /// day both lab boards reached tokio's 512-thread blocking-pool limit
+    /// (all in `i2c_adapter_lock_bus` on i2c-1), after which nothing else in
+    /// mujina could use `spawn_blocking`. Now later callers wait on the async
+    /// lock instead, which their own `timeout` cancels cleanly, and at most
+    /// one thread is ever parked on a wedged bus. `NativeAmlogicPsu` doesn't hold an open file handle
     /// (each exchange opens its own `LinuxI2cDevice`), so cloning the small
     /// set of fields the blocking body needs into a `move` closure is cheap
     /// and doesn't require `Self: 'static` or any lock across the await.
@@ -2078,12 +2087,21 @@ impl NativeAmlogicPsu {
         let i2c_device = self.i2c_device.clone();
         let address = self.address;
         let write_register = self.write_register;
+        let slot = psu_exchange_slot().clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _slot = slot; // released only when the ioctl has returned
             exchange_blocking(&i2c_device, address, write_register, command, &payload)
         })
         .await
         .map_err(|e| anyhow::anyhow!("PSU exchange task panicked: {e}"))?
     }
+}
+
+/// The single in-flight slot for APW12 exchanges (one PSU per process). See
+/// [`NativeAmlogicPsu::exchange`].
+fn psu_exchange_slot() -> &'static Arc<tokio::sync::Mutex<()>> {
+    static SLOT: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
 }
 
 /// Blocking body of [`NativeAmlogicPsu::exchange`]. MUST run via
@@ -2537,6 +2555,65 @@ const THERMAL_THROTTLE_RELEASE_C: f32 = 54.0;
 /// Cap step per telemetry tick (~2 s): throttle down fast, restore slowly.
 const THERMAL_STEP_DOWN_MHZ: u32 = 25;
 const THERMAL_STEP_UP_MHZ: u32 = 6;
+/// After the rail comes up, how long a missing temperature reading holds the
+/// thermal cap (waiting for the PICs/sensors on that rail to answer) before
+/// the stale-sensor floor applies. Fans run at 100 % meanwhile.
+const RAIL_UP_TEMP_GRACE: Duration = Duration::from_secs(60);
+
+/// What the thermal cap decision looks at on one telemetry tick.
+#[derive(Debug, Clone, Copy)]
+struct ThermalInputs {
+    /// No temperature reading for `TEMP_STALE_AFTER`.
+    temp_stale: bool,
+    /// The APW12 rail is up (chips powered).
+    rail_energized: bool,
+    /// The rail came up recently and no reading has arrived yet.
+    awaiting_first_sample: bool,
+    /// This tick has the first real reading since the rail came up.
+    seed_cap: bool,
+    /// Hottest board sensor this tick.
+    board_hottest: Option<f32>,
+}
+
+/// The M4 thermal supervisor's per-chain frequency cap for the next tick.
+fn next_thermal_cap(cap: u32, max_mhz: u32, i: ThermalInputs) -> u32 {
+    if i.temp_stale && !i.rail_energized {
+        // Rail down: the chips are unpowered, so there is nothing to protect
+        // and nothing to read — the PIC sensors are fed from the same 12 V.
+        // Parking the cap at the floor here is what made every resume start
+        // throttled; hold it instead and let the first real sample decide.
+        cap
+    } else if i.awaiting_first_sample {
+        // Rail just came up and its sensors have not answered yet: hold.
+        cap
+    } else if i.temp_stale {
+        // No temperature signal with a LIVE rail — be conservative (fans
+        // already 100 %).
+        THERMAL_CAP_MIN_MHZ
+    } else if let Some(t) = i.board_hottest {
+        if i.seed_cap {
+            // First reading after the rail came up: jump straight to what
+            // this temperature justifies. Only here — the small step-up
+            // elsewhere is what keeps the cap from oscillating around the
+            // throttle point.
+            if t >= THERMAL_THROTTLE_START_C {
+                THERMAL_CAP_MIN_MHZ
+            } else {
+                max_mhz
+            }
+        } else if t >= THERMAL_THROTTLE_HARD_C {
+            THERMAL_CAP_MIN_MHZ
+        } else if t >= THERMAL_THROTTLE_START_C {
+            cap.saturating_sub(THERMAL_STEP_DOWN_MHZ).max(THERMAL_CAP_MIN_MHZ)
+        } else if t <= THERMAL_THROTTLE_RELEASE_C {
+            (cap + THERMAL_STEP_UP_MHZ).min(max_mhz)
+        } else {
+            cap // hysteresis band — hold
+        }
+    } else {
+        cap
+    }
+}
 
 /// Probe one hashboard's PIC for the heartbeat path and return the handle to
 /// keep (or `None` for a genuine noPIC board). Logs its own outcome.
@@ -2703,6 +2780,10 @@ async fn native_telemetry_task(
     // Tracks the rail's previous state so the thermal cap can be seeded from
     // the first real reading after it comes back up (see the throttle below).
     let mut prev_rail_energized = false;
+    // Set when the rail comes up; cleared once the cap has been seeded from a
+    // real temperature reading (or the rail goes down again).
+    let mut seed_pending = false;
+    let mut rail_up_at = std::time::Instant::now();
     // PSU temperature backoff. The APW12 answers command 0x09 whether or not
     // its output is enabled, so we read it even while paused — a supply
     // cooling down from load is worth showing. But if the PSU has no AC at
@@ -2934,49 +3015,44 @@ async fn native_telemetry_task(
         // reading instead of creeping up from wherever it was left. Without
         // this a miner resumed after a pause spends ~12 min at 6 MHz/tick
         // climbing back to its ceiling with chips sitting at 40 C.
-        let seed_cap = rail_energized && !prev_rail_energized;
+        //
+        // The first check after the rail comes up usually has NO reading yet:
+        // the PICs and sensors run off that same rail and answer a few seconds
+        // later (longer when the APW12 starts slowly). Seeding only on the
+        // rising-edge tick therefore often hit the stale path instead, which
+        // dropped the cap to the floor and spent the seed — the ~11 min crawl
+        // from 200 MHz seen on site 2. So the seed stays pending until the
+        // first real reading, and for RAIL_UP_TEMP_GRACE after rail-up a
+        // missing reading holds the cap instead of dropping it (fans are at
+        // 100 % meanwhile).
+        if rail_energized && !prev_rail_energized {
+            seed_pending = true;
+            rail_up_at = std::time::Instant::now();
+        }
+        if !rail_energized {
+            seed_pending = false;
+        }
         prev_rail_energized = rail_energized;
+        let seed_cap = seed_pending && !temp_stale && board_hottest.is_some();
+        let awaiting_first_sample =
+            seed_pending && temp_stale && rail_up_at.elapsed() < RAIL_UP_TEMP_GRACE;
 
         for (chain_idx, (thermal_cap_mhz, thermal_cap_max_mhz)) in
             thermal_caps.iter().enumerate()
         {
             let thermal_cap_max_mhz = *thermal_cap_max_mhz;
             let cap = thermal_cap_mhz.load(Ordering::Relaxed);
-            let new_cap = if temp_stale && !rail_energized {
-                // Rail down: the chips are unpowered, so there is nothing to
-                // protect and nothing to read — the PIC sensors are fed from
-                // the same 12 V. Parking the cap at the floor here is what made
-                // every resume start throttled; hold it instead and let the
-                // first real sample below decide.
-                cap
-            } else if temp_stale {
-                // No temperature signal with a LIVE rail — be conservative
-                // (fans already 100 %).
-                THERMAL_CAP_MIN_MHZ
-            } else if let Some(t) = board_hottest {
-                if seed_cap {
-                    // First reading after the rail came up: jump straight to
-                    // what this temperature justifies. Only here — the small
-                    // step-up elsewhere is what keeps the cap from oscillating
-                    // around the throttle point.
-                    if t >= THERMAL_THROTTLE_START_C {
-                        THERMAL_CAP_MIN_MHZ
-                    } else {
-                        thermal_cap_max_mhz
-                    }
-                } else if t >= THERMAL_THROTTLE_HARD_C {
-                    THERMAL_CAP_MIN_MHZ
-                } else if t >= THERMAL_THROTTLE_START_C {
-                    cap.saturating_sub(THERMAL_STEP_DOWN_MHZ)
-                        .max(THERMAL_CAP_MIN_MHZ)
-                } else if t <= THERMAL_THROTTLE_RELEASE_C {
-                    (cap + THERMAL_STEP_UP_MHZ).min(thermal_cap_max_mhz)
-                } else {
-                    cap // hysteresis band — hold
-                }
-            } else {
-                cap
-            };
+            let new_cap = next_thermal_cap(
+                cap,
+                thermal_cap_max_mhz,
+                ThermalInputs {
+                    temp_stale,
+                    rail_energized,
+                    awaiting_first_sample,
+                    seed_cap,
+                    board_hottest,
+                },
+            );
             if new_cap != cap {
                 if new_cap < cap {
                     warn!(
@@ -2995,6 +3071,9 @@ async fn native_telemetry_task(
                 }
                 thermal_cap_mhz.store(new_cap, Ordering::Relaxed);
             }
+        }
+        if seed_cap {
+            seed_pending = false;
         }
 
         let target_fan_percent: u8 = if crate::commissioning::identify_active() {
@@ -3433,5 +3512,70 @@ inventory::submit! {
         device_type: "s19x_amlogic",
         name: UNIFIED_BOARD_MODEL,
         create_fn: || Box::pin(create_amlogic_board()),
+    }
+}
+
+#[cfg(test)]
+mod thermal_cap_tests {
+    use super::*;
+
+    const MAX: u32 = 560;
+
+    fn inputs(temp_stale: bool, rail: bool, awaiting: bool, seed: bool, t: Option<f32>) -> ThermalInputs {
+        ThermalInputs {
+            temp_stale,
+            rail_energized: rail,
+            awaiting_first_sample: awaiting,
+            seed_cap: seed,
+            board_hottest: t,
+        }
+    }
+
+    /// Site 2, 2026-11-13 09:22: the rail came up, the first check had no
+    /// reading yet. The cap must hold, and the first real reading (cool board)
+    /// must jump it to the ceiling, not leave it at 200 MHz to crawl.
+    #[test]
+    fn rail_up_without_a_reading_holds_then_seeds_to_max() {
+        let cap = MAX;
+        let cap = next_thermal_cap(cap, MAX, inputs(true, true, true, false, None));
+        assert_eq!(cap, MAX, "held while waiting for the first sample");
+        let cap = next_thermal_cap(cap, MAX, inputs(false, true, false, true, Some(30.0)));
+        assert_eq!(cap, MAX);
+    }
+
+    /// Even if the cap was at the floor before the rail came up, the first
+    /// cool reading lifts it to the ceiling in one step.
+    #[test]
+    fn seed_from_floor_jumps_to_max() {
+        let cap = next_thermal_cap(THERMAL_CAP_MIN_MHZ, MAX, inputs(false, true, false, true, Some(41.0)));
+        assert_eq!(cap, MAX);
+    }
+
+    #[test]
+    fn seed_on_a_hot_board_goes_to_the_floor() {
+        let cap = next_thermal_cap(MAX, MAX, inputs(false, true, false, true, Some(60.0)));
+        assert_eq!(cap, THERMAL_CAP_MIN_MHZ);
+    }
+
+    /// After the grace period a live rail with no readings is still unsafe.
+    #[test]
+    fn stale_after_grace_drops_to_the_floor() {
+        let cap = next_thermal_cap(MAX, MAX, inputs(true, true, false, false, None));
+        assert_eq!(cap, THERMAL_CAP_MIN_MHZ);
+    }
+
+    #[test]
+    fn rail_down_holds() {
+        assert_eq!(next_thermal_cap(480, MAX, inputs(true, false, false, false, None)), 480);
+    }
+
+    #[test]
+    fn normal_steps() {
+        let mine = |cap, t| next_thermal_cap(cap, MAX, inputs(false, true, false, false, Some(t)));
+        assert_eq!(mine(500, 40.0), 506);
+        assert_eq!(mine(558, 40.0), MAX);
+        assert_eq!(mine(500, 56.0), 500); // hysteresis
+        assert_eq!(mine(500, 59.0), 475);
+        assert_eq!(mine(500, 65.0), THERMAL_CAP_MIN_MHZ);
     }
 }
